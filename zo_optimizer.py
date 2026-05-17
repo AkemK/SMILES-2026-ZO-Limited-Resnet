@@ -21,75 +21,73 @@ Key design points
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Callable
 
 import torch
 import torch.nn as nn
 
+from augmentation import get_transforms
+from train_data import _get_fixed_indices, SAMPLES_PER_CLASS
 
 class ZeroOrderOptimizer:
-    """Gradient-free optimizer for fine-tuning a subset of model parameters.
-
-    The optimizer maintains a list of *active* parameter names
-    (``self.layer_names``). On each ``.step()`` call it perturbs only those
-    parameters, estimates a pseudo-gradient from forward-pass loss values, and
-    applies an update. All other parameters remain strictly frozen.
-
-    Args:
-        model:            The ``nn.Module`` to optimize.
-        lr:               Step size / learning rate.
-        eps:              Perturbation magnitude for the finite-difference
-                          estimator.
-        perturbation_mode: Distribution used to sample the perturbation
-                          direction. ``"gaussian"`` draws from N(0, I);
-                          ``"uniform"`` draws from U(-1, 1) and normalises.
-
-    Student task:
-        1. Set ``self.layer_names`` to the parameter names you want to tune.
-           Inspect available names with ``[n for n, _ in model.named_parameters()]``.
-        2. Replace or extend ``_estimate_grad`` with a better estimator.
-        3. Replace or extend ``_update_params`` with a better update rule.
-        4. Optionally change ``self.layer_names`` inside ``.step()`` to
-           implement dynamic layer selection strategies.
-
-    Example — tune only the final linear layer::
-
-        optimizer = ZeroOrderOptimizer(model)
-        optimizer.layer_names = ["fc.weight", "fc.bias"]
-    """
-
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
-    ) -> None:
+        lr: float = 5e-4,
+        sigma: float = 0.08,
+        n_batches: int = 256,
+        n_pairs: int = 6,
+        clip: float = 3.0,
+        data_dir: str = "./data",
+    ):
         self.model = model
         self.lr = lr
-        self.eps = eps
+        self.sigma = sigma
+        self.n_pairs = n_pairs
+        self.clip = clip
+        self.n_batches = n_batches
+        self._t = 0
 
-        if perturbation_mode not in ("gaussian", "uniform"):
-            raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
-                f"got '{perturbation_mode}'"
+        self.layer_names = ["fc.weight", "fc.bias"]
+
+        device = next(self.model.parameters()).device
+
+        backbone = copy.deepcopy(self.model)
+        backbone.fc = nn.Identity()
+        backbone.eval()
+
+        try:
+            ds = datasets.CIFAR100(
+                root=data_dir, train=True, download=False,
+                transform=get_transforms(train=False),
             )
-        self.perturbation_mode = perturbation_mode
+            idx = _get_fixed_indices(ds.targets, SAMPLES_PER_CLASS)
+            loader = DataLoader(Subset(ds, idx), batch_size=128, shuffle=False, num_workers=0)
 
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        # ------------------------------------------------------------------
+            n_cls  = self.model.fc.out_features
+            n_feat = self.model.fc.in_features
+            sums   = torch.zeros(n_cls, n_feat, device=device)
+            counts = torch.zeros(n_cls, device=device)
 
+            with torch.no_grad():
+                for imgs, labels in loader:
+                    feats = backbone(imgs.to(device))
+                    for c in range(n_cls):
+                        m = labels.to(device) == c
+                        if m.any():
+                            sums[c]   += feats[m].sum(0)
+                            counts[c] += m.sum().float()
+
+            prototypes = sums / counts.clamp(min=1).unsqueeze(1)
+            self.model.fc.weight.data.copy_(prototypes)
+            self.model.fc.bias.data.zero_()
+
+        except Exception as e:
+            print(f"[ZO] proto init skipped: {e}")
+
+        del backbone
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.
     # ------------------------------------------------------------------
@@ -136,6 +134,12 @@ class ZeroOrderOptimizer:
             u = u / norm
         return u
 
+    def _cosine_lr(self):
+        # cosine decay from lr to lr/10
+        progress = self._t / max(self.n_batches, 1)
+        scale = 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+        return self.lr * scale
+    
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
@@ -168,32 +172,40 @@ class ZeroOrderOptimizer:
         Student task:
             Replace this with a more efficient or accurate estimator:
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+        # antithetic Gaussian ES: n_pairs pairs of perturbations
+        # grad = (1 / (2 * sigma * n_pairs)) * sum_i (f+ - f-) * eps_i
+        acc = {n: torch.zeros_like(p) for n, p in params.items()}
+        first_loss = None
 
         with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+            for i in range(self.n_pairs):
+                noise = {n: torch.randn_like(p) for n, p in params.items()}
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+                for n, p in params.items():
+                    p.data.add_(self.sigma * noise[n])
+                fp = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+                for n, p in params.items():
+                    p.data.sub_(2 * self.sigma * noise[n])
+                fm = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+                for n, p in params.items():
+                    p.data.add_(self.sigma * noise[n])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+                scalar = (fp - fm) / (2 * self.sigma)
+                scalar = max(-self.clip, min(self.clip, scalar))
 
-        return grads
-        # ------------------------------------------------------------------
+                for n in acc:
+                    acc[n].add_(scalar * noise[n])
 
+                if i == 0:
+                    first_loss = fp
+
+        for n in acc:
+            acc[n].div_(self.n_pairs)
+
+        return acc, first_loss
+    
     def _update_params(
         self,
         params: dict[str, nn.Parameter],
@@ -215,13 +227,10 @@ class ZeroOrderOptimizer:
               - Adam-style: maintain first and second moment estimates.
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
+        lr = self._cosine_lr()
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+                param.data.sub_(lr * grads[name])
 
     # ------------------------------------------------------------------
     # Public API
@@ -252,11 +261,8 @@ class ZeroOrderOptimizer:
         """
         params = self._active_params()
 
-        # Record the loss before any perturbation.
-        with torch.no_grad():
-            loss_before = loss_fn()
-
-        grads = self._estimate_grad(loss_fn, params)
+        grads, loss_before = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
 
+        self._t += 1
         return float(loss_before)

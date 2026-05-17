@@ -21,17 +21,6 @@ def init_last_layer(layer: nn.Linear) -> None:
     Args:
         layer: The ``nn.Linear`` layer that serves as the new CIFAR100 head.
                Modifies the layer in-place; return value is ignored.
-
-    Student task:
-        Replace or extend the skeleton below. Some strategies to consider:
-          - ``nn.init.xavier_uniform_``  — preserves variance across layers
-          - ``nn.init.orthogonal_``      — encourages diverse feature directions
-          - Small-scale init (e.g. scale weights by 0.01) — conservative start
-          - Non-zero bias init           — useful when class priors are known
     """
-    # -------------------------------------------------------------------------
-    # STUDENT: Replace or extend the initialization below.
-    # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+    nn.init.zeros_(layer.weight)
     nn.init.zeros_(layer.bias)
-    # -------------------------------------------------------------------------

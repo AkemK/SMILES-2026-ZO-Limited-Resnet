@@ -26,40 +26,20 @@ def get_transforms(train: bool) -> T.Compose:
     Returns:
         A ``torchvision.transforms.Compose`` object ready to be passed to a
         ``torchvision.datasets.CIFAR100`` dataset.
-
-    Student task (training pipeline only):
-        The skeleton includes resize, horizontal flip, and normalization.
-        Consider adding any of the following to improve generalization:
-          - ``T.RandomCrop(224, padding=28)``     — translation invariance
-          - ``T.ColorJitter(...)``                — colour robustness
-          - ``T.RandomRotation(degrees=15)``      — rotational invariance
-          - ``T.RandomErasing(p=0.2)``            — occlusion robustness
-          - ``T.AutoAugment(T.AutoAugmentPolicy.CIFAR10)`` — learned policy
-        Add transforms *before* ``T.ToTensor()`` (spatial/colour ops) or
-        *after* (tensor-level ops such as ``T.RandomErasing``).
     """
     if train:
-        return T.Compose(
-            [
-                # ----------------------------------------------------------
-                # STUDENT: Extend the training pipeline below.
-                # Keep the Resize and Normalize steps; add augmentations
-                # between or around them as appropriate.
-                # ----------------------------------------------------------
-                T.Resize(224),
-                T.RandomHorizontalFlip(),
-                # Add more augmentations here ↓
-                T.ToTensor(),
-                T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-                # ----------------------------------------------------------
-            ]
-        )
+        return T.Compose([
+            T.Resize(232),
+            T.RandomResizedCrop(224, scale=(0.65, 1.0)),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+            T.RandomGrayscale(p=0.1),
+            T.ToTensor(),
+            T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
+        ])
     else:
-        # Fixed validation pipeline — do not modify.
-        return T.Compose(
-            [
-                T.Resize(224),
-                T.ToTensor(),
-                T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-            ]
-        )
+        return T.Compose([
+            T.Resize(224),
+            T.ToTensor(),
+            T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
+        ])
